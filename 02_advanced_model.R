@@ -35,10 +35,6 @@ df.y.test <- fread(paste(datapath, "lm_initial.csv", sep="/"), header = TRUE)
 
 df.y.test <- data.frame(df.y.test, check.names = FALSE)
 df.x <- data.frame(df.x)
-
-df.x$parcelid <- as.character(df.x$parcelid)
-df.y$parcelid <- as.character(df.y$parcelid)
-df.y.test$ParcelId <- as.character(df.y.test$ParcelId)
 ########################################################################
 ###################### Datatype conversion #############################
 ########################################################################
@@ -106,7 +102,7 @@ df.x <- df.x[,-remove.idx]
 
 log.vars <- c("calculatedfinishedsquarefeet","finishedsquarefeet12",
               "finishedsquarefeet15",
-              "finishedsquarefeet15", # log10(x+500)
+              "finishedsquarefeet50", # log10(x+500)
               "lotsizesquarefeet",
               "yardbuildingsqft17",
               "structuretaxvaluedollarcnt",
@@ -191,7 +187,6 @@ paste("training MAE: ", round(train.mae,5))
 paste("testing MAE: ", round(test.mae,5))
 paste("benchmarking testing MAE: ", round(mean(abs(test.y)), 5))
 
-
 #######################################################################
 ## Predict all the qualified data
 #######################################################################
@@ -218,3 +213,100 @@ df.y.final <- df.y.final[match(df.y.test$ParcelId, df.y.final$ParcelId),]
 
 ## Linear regression model with fips, month and area as predictors
 write.csv(df.y.final, file=paste(datapath, "lm_third.csv", sep="/"), row.names = FALSE, quote=FALSE)
+
+########################################################################
+######################## Boosting Tree xgboost #########################
+########################################################################
+## Exclude logerror and parcelid
+type.df <- checkType(data1)
+all.vars <- subset(type.df, !name %in% c("parcelid", "logerror") &
+                       freq==0)$name
+
+set.seed(12)
+train.idx <- sample(nrow(data1), 0.7*nrow(data1))
+
+formula <- as.formula(paste("logerror", paste(all.vars, collapse=" + "), sep=" ~ "))
+
+data.x <- sparse.model.matrix(formula, data=data1)
+
+dall <- xgb.DMatrix(data = data.x, label = data1$logerror)
+dtrain <- xgb.DMatrix(data = data.x[train.idx,], label = data1$logerror[train.idx])
+dtest <- xgb.DMatrix(data = data.x[-train.idx,], label = data1$logerror[-train.idx])
+
+fit <- xgboost(data = dtrain, nrounds = 250, maxdepth = 4, 
+               params = list(eta=0.03), eval_metric = "mae",
+               early_stopping_rounds = 10, colsample_bytree = 0.5)
+
+# Cross validation to find the optimal parameters
+bst.cv <- xgb.cv(data = dall, nrounds = 1000, maxdepth = 4, 
+                 params = list(eta=0.03), eval_metric = "mae",
+                 nfold=6, colsample_bytree = 0.5,
+                 early_stopping_rounds = 10)
+
+## Fit all data to improve accuracy
+fit <- xgboost(data = dall, nrounds = 265, maxdepth = 4, 
+               params = list(eta=0.03), eval_metric = "mae",
+               early_stopping_rounds = 10, colsample_bytree = 0.5)
+########################################################################
+######################### Model evaluation #############################
+########################################################################
+train.pred <- predict(fit, dtrain)
+train.y <- data1[train.idx,]$logerror
+train.mae <- mean(abs(train.pred - train.y))
+plot(train.pred, train.y)
+
+test.pred <- predict(fit, dtest)
+test.y <- data1[-train.idx,]$logerror
+test.mae <- mean(abs(test.pred - test.y))
+plot(test.pred, test.y)
+
+paste("training MAE: ", round(train.mae,5))
+paste("testing MAE: ", round(test.mae,5))
+paste("benchmarking testing MAE: ", round(mean(abs(test.y)), 5))
+
+#######################################################################
+## Predict all the qualified data
+#######################################################################
+## Select the qualified data
+vars <- all.vars[all.vars %in% colnames(df.x)]
+df.x1 <- df.x[,vars]
+row.keep <- apply(df.x1, 1, function(x) sum(is.na(x)) < 1)
+df.x1 <- df.x1[row.keep,]
+parcelid <- df.x$parcelid[row.keep]
+
+## Prepare data for xgboost prediction
+prepareData <- function(df.x) {
+    formula <- as.formula(paste("", paste(all.vars, collapse=" + "), sep=" ~ "))
+    data.x1 <- sparse.model.matrix(formula, data=df.x)
+    dmat <- xgb.DMatrix(data = data.x1)
+    dmat
+}
+# October
+df.x1$month <- factor("10", levels=c("01","02","03","04","05","06","07","08","09","10","11","12"))
+dmat <- prepareData(df.x1)
+df.y.pred <- predict(fit, dmat)
+# November
+df.x1$month <- factor("11", levels=c("01","02","03","04","05","06","07","08","09","10","11","12"))
+dmat <- prepareData(df.x1)
+df.y.pred <- cbind(df.y.pred, predict(fit, dmat))
+# December
+df.x1$month <- factor("12", levels=c("01","02","03","04","05","06","07","08","09","10","11","12"))
+dmat <- prepareData(df.x1)
+df.y.pred <- cbind(df.y.pred, predict(fit, dmat))
+# Copy for second year
+df.y <- cbind(df.y.pred, df.y.pred)
+
+
+df.y <- data.frame(round(df.y, 6))
+df.y <- cbind(parcelid, df.y)
+colnames(df.y) <- colnames(df.y.test)
+df.y$ParcelId <- as.character(df.y$ParcelId)
+
+## Keep the predictions that current model could not handle
+df.y.missing <- subset(df.y.test, ! ParcelId %in% df.y$ParcelId)
+
+df.y.final <- rbind(df.y, df.y.missing)
+df.y.final <- df.y.final[match(df.y.test$ParcelId, df.y.final$ParcelId),]
+
+## Linear regression model with fips, month and area as predictors
+write.csv(df.y.final, file=paste(datapath, "xgboost_first.csv", sep="/"), row.names = FALSE, quote=FALSE)
